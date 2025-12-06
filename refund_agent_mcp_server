@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+refund_agent_mcp_server.py
+
+A fully self-contained MCP (Model Context Protocol) server that exposes the
+Refund Agent workflow as a tool: deterministic rules + RAG + LLM explanation.
+
+Supports BOTH FAISS (local) and Pinecone (managed cloud) vector backends,
+switchable via USE_PINECONE flag.
+
+This file can be used by Claude Desktop, ChatGPT Desktop, LM Studio,
+LangGraph, or any MCP-compatible LLM environment.
+
+"""
+
+import os
+import json
+from datetime import date
+from typing import Dict, Any, List
+
+# -------------------------------
+# 1. API KEYS (replace placeholders)
+# -------------------------------
+
+os.environ["NVIDIA_API_KEY"] = "<YOUR_NVIDIA_API_KEY>"
+os.environ["PINECONE_API_KEY"] = "<YOUR_PINECONE_KEY>"
+PINECONE_INDEX_NAME = "refund-policy-index"
+
+# -------------------------------
+# 2. LLM + Embeddings
+# -------------------------------
+from langchain_nvidia_ai_endpoints import ChatNVIDIA, NVIDIAEmbeddings
+
+LLM_MODEL = "deepseek-ai/deepseek-v3.1"
+EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"
+
+llm = ChatNVIDIA(model=LLM_MODEL)
+embeddings = NVIDIAEmbeddings(model=EMBED_MODEL)
+
+# -------------------------------
+# 3. Refund Policy Document
+# -------------------------------
+REFUND_POLICY = """
+Refund Policy v1
+
+Global rules:
+- Standard products: customers can request a refund within 30 days from delivery.
+- Defective products: refund window = 45 days.
+
+Region rules:
+- EU: 60 days (regardless of defect status)
+- US: follows global rules.
+
+Additional:
+- Only delivered orders may be refunded.
+- Already refunded orders cannot be refunded again.
+"""
+
+# -------------------------------
+# 4. Chunk Policy + Build Vector Stores
+# -------------------------------
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+
+splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=80)
+policy_docs = splitter.create_documents([REFUND_POLICY])
+
+# FAISS
+faiss_vectorstore = FAISS.from_documents(policy_docs, embeddings)
+faiss_retriever = faiss_vectorstore.as_retriever(search_kwargs={"k": 3})
+
+# Pinecone
+USE_PINECONE = False  # flip this to True for cloud backend
+
+pinecone_retriever = None
+if USE_PINECONE:
+    from pinecone import Pinecone
+    from langchain_pinecone import PineconeVectorStore
+
+    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    pinecone_vectorstore = PineconeVectorStore.from_documents(
+        policy_docs,
+        embeddings,
+        index_name=PINECONE_INDEX_NAME,
+        namespace="refund-policy",
+    )
+    pinecone_retriever = pinecone_vectorstore.as_retriever()
+
+
+def get_retriever():
+    if USE_PINECONE:
+        return pinecone_retriever
+    return faiss_retriever
+
+
+# -------------------------------
+# 5. Synthetic Orders DB
+# -------------------------------
+ORDERS = [
+    {
+        "order_id": "ORD-1001",
+        "country": "US",
+        "delivery_date": date(2025, 11, 10),
+        "is_defective": False,
+        "already_refunded": False,
+        "amount": 100.0,
+    },
+    {
+        "order_id": "ORD-1002",
+        "country": "US",
+        "delivery_date": date(2025, 10, 1),
+        "is_defective": True,
+        "already_refunded": False,
+        "amount": 200.0,
+    },
+    {
+        "order_id": "ORD-1003",
+        "country": "EU",
+        "delivery_date": date(2025, 11, 5),
+        "is_defective": False,
+        "already_refunded": False,
+        "amount": 80.0,
+    },
+]
+
+def lookup_order(order_id):
+    return next((o for o in ORDERS if o["order_id"] == order_id), None)
+
+
+# -------------------------------
+# 6. Deterministic Rules Engine
+# -------------------------------
+def check_refund_eligibility(order, claimed_defective):
+    if order is None:
+        return {"eligible": False, "reason": "Order not found."}
+
+    if order["already_refunded"]:
+        return {"eligible": False, "reason": "Order already refunded."}
+
+    delivery_date = order["delivery_date"]
+    days_since = (date.today() - delivery_date).days
+
+    country = order["country"]
+    defective = claimed_defective
+
+    if country == "EU":
+        window = 60
+    else:
+        window = 45 if defective else 30
+
+    if days_since <= window:
+        return {
+            "eligible": True,
+            "reason": f"Within {window}-day window.",
+            "window_days": window,
+            "days_since": days_since,
+        }
+
+    return {
+        "eligible": False,
+        "reason": f"Outside {window}-day window.",
+        "window_days": window,
+        "days_since": days_since,
+    }
+
+
+def refund_decision_engine(order_id, claimed_defective):
+    order = lookup_order(order_id)
+
+    elig = check_refund_eligibility(order, claimed_defective)
+
+    if not elig["eligible"]:
+        return {
+            "status": "rejected",
+            "reason": elig["reason"],
+            "refunded": False,
+            "refund_amount": 0.0,
+            "days_since_delivery": elig.get("days_since"),
+            "window_days": elig.get("window_days"),
+        }
+
+    # Approve
+    order["already_refunded"] = True
+    return {
+        "status": "approved",
+        "reason": elig["reason"],
+        "refunded": True,
+        "refund_amount": order["amount"],
+        "days_since_delivery": elig.get("days_since"),
+        "window_days": elig.get("window_days"),
+    }
+
+
+# -------------------------------
+# 7. RAG + LLM Explanation
+# -------------------------------
+def explain_refund_with_policy(order_id, claimed_defective):
+    decision = refund_decision_engine(order_id, claimed_defective)
+    retriever = get_retriever()
+
+    docs = retriever.invoke("refund policy rules for this order")
+    policy_context = "\n\n".join(d.page_content for d in docs)
+
+    prompt = f"""
+You are a customer service assistant.
+
+Refund policy:
+{policy_context}
+
+Decision:
+{json.dumps(decision, indent=2)}
+
+Write an empathetic explanation to the customer.
+"""
+
+    return str(llm.invoke(prompt))
+
+
+# -------------------------------
+# 8. MCP Tool API Wrapper
+# -------------------------------
+def refund_agent_api(order_id: str, claimed_defective: bool) -> Dict[str, Any]:
+    decision = refund_decision_engine(order_id, claimed_defective)
+    explanation = explain_refund_with_policy(order_id, claimed_defective)
+
+    return {
+        "order_id": order_id,
+        "claimed_defective": claimed_defective,
+        "status": decision["status"],
+        "reason": decision["reason"],
+        "refunded": decision["refunded"],
+        "refund_amount": decision["refund_amount"],
+        "days_since_delivery": decision.get("days_since_delivery"),
+        "window_days": decision.get("window_days"),
+        "explanation": explanation,
+    }
+
+
+# -------------------------------
+# 9. MCP Server (oai-agent / Claude MCP)
+# -------------------------------
+from mcp.server import Server
+from mcp.types import Tool, TextContent
+
+server = Server("refund-agent-mcp")
+
+@server.tool(
+    name="refund_agent",
+    description="Process a refund request and return decision + explanation.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "order_id": {"type": "string"},
+            "claimed_defective": {"type": "boolean"},
+        },
+        "required": ["order_id", "claimed_defective"],
+    },
+)
+def refund_agent_tool(input: dict):
+    order_id = input["order_id"]
+    claimed_defective = input["claimed_defective"]
+
+    result = refund_agent_api(order_id, claimed_defective)
+    return {
+        "type": "output",
+        "content": [TextContent(text=json.dumps(result, indent=2))],
+    }
+
+
+if __name__ == "__main__":
+    server.run()
